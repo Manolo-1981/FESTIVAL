@@ -1,7 +1,10 @@
+export const LYRIC_LIMIT = 800;
+
 export const DEMO_LYRICS = [
   "Canto bajito esta noche\npara que me escuche el silencio.",
   "Si el fondo cambia, yo me quedo\ncon la misma voz de siempre.",
   "Una luz, una foto\ny el compás que traigo yo.",
+  "Hoy el telón se abre despacio\ny la luz me encuentra de frente.\nSi canto, que sea con calma,\ncon el fondo que yo elegí.",
 ];
 
 export function lyricLines(text: string): string[] {

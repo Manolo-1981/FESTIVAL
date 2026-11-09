@@ -92,7 +92,7 @@ input[type="range"] {
 }
 
 .person-shadow {
-  box-shadow: 0 14px 30px rgb(0 0 0 / 0.45);
+  filter: drop-shadow(0 16px 14px rgb(0 0 0 / 0.5));
 }
 
 .panel {

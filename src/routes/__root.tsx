@@ -3,7 +3,7 @@ import { AuthProvider } from "@/lib/auth/provider";
 import { PreviewHostBridge } from "@/components/preview-host-bridge";
 import appCss from "../styles.css?url";
 
-const APP_NAME = "Escena";
+const APP_NAME = "FESTIVAL";
 
 export const Route = createRootRoute({
   head: () => ({
@@ -13,7 +13,7 @@ export const Route = createRootRoute({
       { title: APP_NAME },
       {
         name: "description",
-        content: "Sube una foto, ponle una canción y cambia el fondo del escenario.",
+        content: "Una foto canta en FESTIVAL, con el fondo, la letra y la música que elijas.",
       },
       { name: "theme-color", content: "#0c0c0e" },
     ],

@@ -1,15 +1,17 @@
 import { useEffect, useRef, useState } from "react";
-import { Clapperboard, ImagePlus, Loader2, Music, Pause, Play, RotateCcw } from "lucide-react";
+import { Clapperboard, Download, ImagePlus, Loader2, Music, Pause, Play, RotateCcw } from "lucide-react";
 import { StageView } from "@/components/stage-view";
 import { Button } from "@/components/ui/button";
+import { BACKING_NAME, BACKINGS, backingBuffer, backingObjectUrl, isBackingUrl, type BackingId } from "@/lib/backing";
 import { BACKGROUNDS, backgroundSrc, sceneKey } from "@/lib/backgrounds";
 import { cn } from "@/lib/cn";
 import { composeScene, loadImage } from "@/lib/compose";
-import { DEMO_LYRICS, formatTime, lineAt, lyricLines } from "@/lib/lyrics";
-import { pollSingingClip, singStatus, startSingingClip } from "@/lib/sing";
-import { useStudio } from "@/lib/studio-store";
+import { cutoutPerson } from "@/lib/cutout";
+import { DEMO_LYRICS, LYRIC_LIMIT, formatTime, lineAt, lyricLines } from "@/lib/lyrics";
+import { downloadClip, pollSingingClip, singStatus, startSingingClip } from "@/lib/sing";
+import { useStudio, type ClipSeconds } from "@/lib/studio-store";
 
-type ModuleId = "cantar" | "fondo";
+type ModuleId = "cantar" | "fondo" | "mas";
 type Job =
   | { state: "idle" }
   | { state: "preparing" }
@@ -21,7 +23,11 @@ type Graph = {
   ctx: AudioContext;
   analyser: AnalyserNode;
   bins: Uint8Array;
+  bed: AudioBufferSourceNode | null;
+  bedGain: GainNode | null;
 };
+
+const ACTION_LIMIT = 400;
 
 const AUDIO_EXT = /\.(mp3|m4a|wav|ogg|aac|flac|webm)$/i;
 
@@ -50,7 +56,25 @@ function takeAudio(file: File) {
 }
 
 function replaceBlob(previous: string | null, next: string | null) {
-  if (previous && previous !== next && previous.startsWith("blob:")) URL.revokeObjectURL(previous);
+  if (
+    previous &&
+    previous !== next &&
+    previous.startsWith("blob:") &&
+    !isBackingUrl(previous)
+  ) {
+    URL.revokeObjectURL(previous);
+  }
+}
+
+function base64ToBlob(base64: string) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  const step = 0x8000;
+  for (let index = 0; index < binary.length; index += step) {
+    const end = Math.min(index + step, binary.length);
+    for (let cursor = index; cursor < end; cursor++) bytes[cursor] = binary.charCodeAt(cursor);
+  }
+  return new Blob([bytes], { type: "video/mp4" });
 }
 
 export function Studio() {
@@ -69,6 +93,10 @@ export function Studio() {
   const aspect = useStudio((s) => s.aspect);
   const songTitle = useStudio((s) => s.songTitle);
   const lyrics = useStudio((s) => s.lyrics);
+  const action = useStudio((s) => s.action);
+  const clipSeconds = useStudio((s) => s.clipSeconds);
+  const backing = useStudio((s) => s.backing);
+  const ownAudioUrl = useStudio((s) => s.ownAudioUrl);
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
@@ -83,6 +111,8 @@ export function Studio() {
   const [current, setCurrent] = useState(0);
   const [duration, setDuration] = useState(0);
   const [notice, setNotice] = useState("");
+  const [status, setStatus] = useState("");
+  const [saving, setSaving] = useState(false);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [job, setJob] = useState<Job>({ state: "idle" });
   const [ai, setAi] = useState<{ enabled: boolean; remaining: number } | null>(null);
@@ -93,7 +123,16 @@ export function Studio() {
 
   useEffect(() => {
     aliveRef.current = true;
-    void useStudio.persist.rehydrate();
+    const rehydrated = useStudio.persist.rehydrate();
+    void Promise.resolve(rehydrated).then(async () => {
+      const state = useStudio.getState();
+      if (!aliveRef.current || state.backing === "none" || state.audioUrl) return;
+      const url = await backingObjectUrl(state.backing);
+      if (!aliveRef.current) return;
+      const current = useStudio.getState();
+      if (current.backing === "none" || current.audioUrl) return;
+      useStudio.getState().patch({ audioUrl: url, audioName: BACKING_NAME[current.backing] });
+    });
     void singStatus()
       .then((status) => {
         if (aliveRef.current) setAi(status);
@@ -177,8 +216,55 @@ export function Studio() {
     source.connect(analyser);
     analyser.connect(ctx.destination);
     const bins = new Uint8Array(analyser.frequencyBinCount);
-    graphRef.current = { ctx, analyser, bins };
+    graphRef.current = { ctx, analyser, bins, bed: null, bedGain: null };
     return graphRef.current;
+  }
+
+  const bedToken = useRef(0);
+
+  function stopBed() {
+    bedToken.current += 1;
+    const graph = graphRef.current;
+    if (!graph?.bed) return;
+    try {
+      graph.bed.stop();
+    } catch {
+      /* already stopped */
+    }
+    graph.bed.disconnect();
+    graph.bedGain?.disconnect();
+    graph.bed = null;
+    graph.bedGain = null;
+  }
+
+  async function startBed() {
+    const token = ++bedToken.current;
+    const state = useStudio.getState();
+    if (state.backing === "none" || !state.ownAudioUrl) return;
+    const graph = ensureGraph();
+    const audio = audioRef.current;
+    if (!graph || !audio) return;
+    const buffer = await backingBuffer(state.backing);
+    if (token !== bedToken.current || audio.paused) return;
+    if (graph.bed) {
+      try {
+        graph.bed.stop();
+      } catch {
+        /* already stopped */
+      }
+      graph.bed.disconnect();
+      graph.bedGain?.disconnect();
+    }
+    const source = graph.ctx.createBufferSource();
+    const gain = graph.ctx.createGain();
+    source.buffer = buffer;
+    source.loop = true;
+    gain.gain.value = 0.42;
+    source.connect(gain);
+    gain.connect(graph.analyser);
+    source.start();
+    graph.bed = source;
+    graph.bedGain = gain;
   }
 
   async function toggle() {
@@ -187,8 +273,13 @@ export function Studio() {
     const graph = ensureGraph();
     try {
       if (graph && graph.ctx.state === "suspended") await graph.ctx.resume();
-      if (audio.paused) await audio.play();
-      else audio.pause();
+      if (audio.paused) {
+        await audio.play();
+        await startBed();
+      } else {
+        stopBed();
+        audio.pause();
+      }
     } catch {
       setNotice("No se pudo reproducir ese audio.");
     }
@@ -197,12 +288,24 @@ export function Studio() {
 
   async function onPhoto(file: File) {
     try {
-      const url = await takePhoto(file);
-      replaceBlob(useStudio.getState().personUrl, url);
-      patch({ personUrl: url });
-      setVideoUrl(null);
+      const raw = await takePhoto(file);
       setNotice("");
+      setStatus("Separando a la persona del fondo de la foto…");
+      try {
+        const cut = await cutoutPerson(raw);
+        URL.revokeObjectURL(raw);
+        replaceBlob(useStudio.getState().personUrl, cut);
+        patch({ personUrl: cut, mask: "completo" });
+        setStatus("");
+      } catch (error) {
+        replaceBlob(useStudio.getState().personUrl, raw);
+        patch({ personUrl: raw });
+        setStatus("");
+        setNotice(error instanceof Error ? error.message : "No pude separar el fondo. La foto se muestra completa.");
+      }
+      setVideoUrl(null);
     } catch (error) {
+      setStatus("");
       setNotice(error instanceof Error ? error.message : "No se pudo abrir la foto.");
     }
   }
@@ -221,20 +324,61 @@ export function Studio() {
   function onAudio(file: File) {
     try {
       const url = takeAudio(file);
-      const audio = audioRef.current;
-      audio?.pause();
-      replaceBlob(useStudio.getState().audioUrl, url);
-      patch({ audioUrl: url, audioName: file.name });
+      audioRef.current?.pause();
+      stopBed();
+      replaceBlob(useStudio.getState().ownAudioUrl, url);
+      patch({
+        ownAudioUrl: url,
+        ownAudioName: file.name,
+        audioUrl: url,
+        audioName: file.name,
+      });
       setNotice("");
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "No se pudo abrir el audio.");
     }
   }
 
-  function clearAudio() {
+  async function clearAudio() {
     audioRef.current?.pause();
-    replaceBlob(useStudio.getState().audioUrl, null);
-    patch({ audioUrl: null, audioName: "" });
+    stopBed();
+    const state = useStudio.getState();
+    replaceBlob(state.ownAudioUrl, null);
+    if (state.backing !== "none") {
+      const url = await backingObjectUrl(state.backing);
+      patch({ ownAudioUrl: null, ownAudioName: "", audioUrl: url, audioName: BACKING_NAME[state.backing] });
+      return;
+    }
+    patch({ ownAudioUrl: null, ownAudioName: "", audioUrl: null, audioName: "" });
+  }
+
+  async function chooseBacking(id: "none" | BackingId) {
+    audioRef.current?.pause();
+    stopBed();
+    const state = useStudio.getState();
+    if (id === "none") {
+      patch({
+        backing: "none",
+        audioUrl: state.ownAudioUrl,
+        audioName: state.ownAudioName,
+      });
+      return;
+    }
+    setNotice("");
+    setStatus("Preparando el acompañamiento…");
+    try {
+      if (state.ownAudioUrl) {
+        await backingBuffer(id);
+        patch({ backing: id, audioUrl: state.ownAudioUrl, audioName: state.ownAudioName });
+      } else {
+        const url = await backingObjectUrl(id);
+        patch({ backing: id, audioUrl: url, audioName: BACKING_NAME[id] });
+      }
+      setStatus("");
+    } catch {
+      setStatus("");
+      setNotice("No se pudo preparar el acompañamiento.");
+    }
   }
 
   async function createClip() {
@@ -244,8 +388,8 @@ export function Studio() {
       setNotice("Primero sube una foto.");
       return;
     }
-    if (state.lyrics.trim().length < 8) {
-      setNotice("Escribe al menos una frase para el video cantado.");
+    if (state.lyrics.trim().length < 8 && state.action.trim().length < 8) {
+      setNotice("Escribe la letra o qué debe hacer la persona en la escena.");
       return;
     }
     setNotice("");
@@ -265,7 +409,13 @@ export function Studio() {
       if (!aliveRef.current) return;
       setJob({ state: "generating" });
       const started = await startSingingClip({
-        data: { imageDataUrl, lyrics: state.lyrics, scene: sceneKey(state.bgId) },
+        data: {
+          imageDataUrl,
+          lyrics: state.lyrics,
+          scene: sceneKey(state.bgId),
+          duration: state.clipSeconds,
+          action: state.action,
+        },
       });
       if (!aliveRef.current) return;
       if (!started.ok) {
@@ -273,7 +423,7 @@ export function Studio() {
         return;
       }
       setAi((prev) => (prev ? { ...prev, remaining: started.remaining } : prev));
-      for (let attempt = 0; attempt < 40; attempt++) {
+      for (let attempt = 0; attempt < 70; attempt++) {
         await sleep(4000);
         if (!aliveRef.current) return;
         const polled = await pollSingingClip({ data: { requestId: started.requestId } });
@@ -283,6 +433,8 @@ export function Studio() {
           return;
         }
         if (polled.status === "done") {
+          audioRef.current?.pause();
+          stopBed();
           setVideoUrl(polled.url);
           setJob({ state: "ready" });
           return;
@@ -301,10 +453,33 @@ export function Studio() {
     }
   }
 
+  async function saveVideo() {
+    if (!videoUrl || saving) return;
+    setSaving(true);
+    setNotice("");
+    try {
+      const result = await downloadClip({ data: { url: videoUrl } });
+      if (!result.ok) {
+        setNotice(result.error);
+        return;
+      }
+      const href = URL.createObjectURL(base64ToBlob(result.base64));
+      const link = document.createElement("a");
+      link.href = href;
+      link.download = "festival.mp4";
+      link.click();
+      URL.revokeObjectURL(href);
+    } catch {
+      setNotice("No se pudo guardar el video.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <main className="mx-auto min-h-dvh w-full max-w-6xl px-4 py-6 pb-16 lg:px-8">
       <header className="mb-6 max-w-xl">
-        <h1 className="font-display text-4xl leading-tight font-medium tracking-tight text-fg">Escena</h1>
+        <h1 className="font-display text-4xl leading-tight font-medium tracking-[0.18em] text-fg">FESTIVAL</h1>
         <p className="mt-2 text-base text-muted">Una foto, una canción y el fondo que elijas.</p>
       </header>
 
@@ -318,7 +493,7 @@ export function Studio() {
             onPhoto={(file) => void onPhoto(file)}
           />
           <div className="mx-auto mt-3 grid max-w-md justify-items-center gap-2">
-            {audioUrl ? (
+            {audioUrl && playing ? (
               <div ref={meterRef} className="flex h-8 w-40 items-end justify-center gap-1" aria-hidden>
                 {Array.from({ length: 12 }, (_, index) => (
                   <span
@@ -335,7 +510,7 @@ export function Studio() {
         </div>
 
         <div className="grid min-w-0 gap-4">
-          <div className="grid grid-cols-2 gap-1 rounded-lg bg-surface p-1 lg:hidden">
+          <div className="grid grid-cols-3 gap-1 rounded-lg bg-surface p-1 lg:hidden">
             <button
               type="button"
               aria-pressed={module === "cantar"}
@@ -358,8 +533,24 @@ export function Studio() {
             >
               Fondo
             </button>
+            <button
+              type="button"
+              aria-pressed={module === "mas"}
+              className={cn(
+                "min-h-11 rounded-md text-sm font-medium",
+                module === "mas" ? "bg-accent text-accent-fg" : "text-muted",
+              )}
+              onClick={() => setModule("mas")}
+            >
+              Más
+            </button>
           </div>
 
+          {status ? (
+            <p className="rounded-lg border border-line bg-surface px-3 py-2 text-sm text-muted" aria-live="polite">
+              {status}
+            </p>
+          ) : null}
           {notice ? (
             <p role="alert" className="rounded-lg border border-line bg-surface px-3 py-2 text-sm text-danger">
               {notice}
@@ -420,10 +611,43 @@ export function Studio() {
             </label>
 
             <div className="grid gap-2">
+              <p className="text-sm text-muted">Acompañamiento</p>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  aria-pressed={backing === "none"}
+                  className={cn(
+                    "min-h-11 rounded-lg border px-3 text-sm font-medium",
+                    backing === "none" ? "border-accent bg-accent text-accent-fg" : "border-line text-fg",
+                  )}
+                  onClick={() => void chooseBacking("none")}
+                >
+                  Ninguno
+                </button>
+                {BACKINGS.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    aria-pressed={backing === item.id}
+                    className={cn(
+                      "min-h-11 rounded-lg border px-3 text-sm font-medium",
+                      backing === item.id ? "border-accent bg-accent text-accent-fg" : "border-line text-fg",
+                    )}
+                    onClick={() => void chooseBacking(item.id)}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+              <p className="text-sm text-muted">
+                {backing !== "none" && ownAudioUrl
+                  ? "La pista suena debajo de tu canción."
+                  : "Pistas originales para el escenario. El video cantado lleva su propia música."}
+              </p>
               <div className="flex flex-wrap gap-2">
                 <label className="inline-flex min-h-11 cursor-pointer items-center justify-center gap-2 rounded-lg border border-line bg-surface-2 px-4 text-sm font-medium text-fg">
                   <Music className="size-4" aria-hidden />
-                  {audioUrl ? "Cambiar audio" : "Subir audio"}
+                  {ownAudioUrl ? "Cambiar audio" : "Subir audio"}
                   <input
                     type="file"
                     accept="audio/*,.mp3,.m4a,.wav,.ogg"
@@ -435,8 +659,8 @@ export function Studio() {
                     }}
                   />
                 </label>
-                {audioUrl ? (
-                  <Button variant="ghost" onClick={clearAudio}>
+                {ownAudioUrl ? (
+                  <Button variant="ghost" onClick={() => void clearAudio()}>
                     Quitar audio
                   </Button>
                 ) : null}
@@ -470,13 +694,15 @@ export function Studio() {
             <label className="grid gap-2 text-sm text-muted">
               <span className="flex items-center justify-between">
                 Letra
-                <span className="tabular-nums">{lyrics.length}/180</span>
+                <span className="tabular-nums">
+                  {lyrics.length}/{LYRIC_LIMIT}
+                </span>
               </span>
               <textarea
                 value={lyrics}
-                maxLength={180}
-                rows={4}
-                placeholder="Una frase por línea."
+                maxLength={LYRIC_LIMIT}
+                rows={6}
+                placeholder="Una frase por línea. Cabe una estrofa más larga."
                 onChange={(event) => patch({ lyrics: event.target.value })}
                 className="rounded-lg border border-line bg-bg px-3 py-2 text-fg"
               />
@@ -490,7 +716,7 @@ export function Studio() {
                   className="min-h-11 rounded-lg border border-line px-3 py-2 text-left text-sm text-fg"
                   onClick={() => patch({ lyrics: sample })}
                 >
-                  {sample.replace("\n", " / ")}
+                  {sample.replaceAll("\n", " / ")}
                 </button>
               ))}
             </div>
@@ -498,8 +724,8 @@ export function Studio() {
             <div className="grid gap-2 border-t border-line pt-4">
               <h3 className="text-sm font-medium text-fg">Video cantado</h3>
               <p className="text-sm text-muted">
-                La foto canta la letra durante unos 6 segundos, con el fondo de ahora. Tu audio no entra en
-                el video: suena solo en el escenario. Cada video usa créditos.
+                La foto canta la letra, con música, sobre el fondo de ahora. Tu audio no entra en el video:
+                suena en el escenario. 10 y 15 segundos usan más créditos.
               </p>
               {ai && !ai.enabled ? (
                 <p className="text-sm text-muted">
@@ -516,7 +742,7 @@ export function Studio() {
                 </Button>
               )}
               {ai?.enabled ? (
-                <p className="text-sm text-muted">Puedes crear {ai.remaining} videos más en esta hora.</p>
+                <p className="text-sm text-muted">Quedan {ai.remaining} créditos de video en esta hora.</p>
               ) : null}
               {job.state === "error" ? (
                 <p role="alert" className="text-sm text-danger">
@@ -525,13 +751,21 @@ export function Studio() {
               ) : null}
               {job.state === "generating" ? (
                 <p className="text-sm text-muted" aria-live="polite">
-                  Puede tardar un minuto. No cierres la página.
+                  {clipSeconds === 6
+                    ? "Puede tardar un minuto. No cierres la página."
+                    : "Un video más largo puede tardar unos minutos. No cierres la página."}
                 </p>
               ) : null}
               {videoUrl ? (
-                <Button variant="secondary" onClick={() => setVideoUrl(null)}>
-                  Volver al escenario
-                </Button>
+                <div className="flex flex-wrap gap-2">
+                  <Button onClick={() => void saveVideo()} disabled={saving}>
+                    {saving ? <Loader2 className="size-4 animate-spin" /> : <Download className="size-4" />}
+                    {saving ? "Guardando" : "Guardar video"}
+                  </Button>
+                  <Button variant="secondary" onClick={() => setVideoUrl(null)}>
+                    Volver al escenario
+                  </Button>
+                </div>
               ) : null}
             </div>
             <p className="text-sm text-muted">Usa fotos y canciones que tengas derecho a usar.</p>
@@ -630,7 +864,9 @@ export function Studio() {
                 ]}
                 onChange={(value) => patch({ mask: value })}
               />
-              <p className="text-sm text-muted">Un PNG con fondo transparente se integra mejor.</p>
+              <p className="text-sm text-muted">
+                Al subir la foto se quita su fondo, para que la persona quede sobre esta escena.
+              </p>
             </fieldset>
 
             <Slider label="Tamaño" min={0.75} max={1.3} step={0.01} value={scale} display={`${Math.round(scale * 100)}%`} onChange={(value) => patch({ scale: value })} />
@@ -643,6 +879,52 @@ export function Studio() {
               Centrar
             </Button>
           </section>
+
+          <section
+            className={cn(
+              "panel grid gap-4 border border-line bg-surface p-4",
+              module !== "mas" && "hidden lg:block",
+            )}
+          >
+            <div>
+              <h2 className="font-display text-2xl font-medium text-fg">Adicionales</h2>
+              <p className="mt-1 text-sm text-muted">
+                Escribe qué hace la persona en la escena y cuánto dura el video.
+              </p>
+            </div>
+
+            <label className="grid gap-2 text-sm text-muted">
+              <span className="flex items-center justify-between">
+                Prompt de la escena
+                <span className="tabular-nums">
+                  {action.length}/{ACTION_LIMIT}
+                </span>
+              </span>
+              <textarea
+                value={action}
+                maxLength={ACTION_LIMIT}
+                rows={4}
+                placeholder="Saluda, da un paso, gira, levanta la mano y canta hacia la cámara."
+                onChange={(event) => patch({ action: event.target.value })}
+                className="rounded-lg border border-line bg-bg px-3 py-2 text-fg"
+              />
+            </label>
+
+            <fieldset className="grid gap-2">
+              <legend className="text-sm text-muted">Duración</legend>
+              <Segmented
+                value={String(clipSeconds) as "6" | "10" | "15"}
+                columns={3}
+                options={[
+                  { id: "6", label: "6 s" },
+                  { id: "10", label: "10 s" },
+                  { id: "15", label: "15 s" },
+                ]}
+                onChange={(value) => patch({ clipSeconds: Number(value) as ClipSeconds })}
+              />
+              <p className="text-sm text-muted">6 segundos usa 1 crédito. 10 y 15 segundos usan 2.</p>
+            </fieldset>
+          </section>
         </div>
       </div>
 
@@ -650,10 +932,17 @@ export function Studio() {
         ref={audioRef}
         src={audioUrl ?? undefined}
         preload="metadata"
+        loop={backing !== "none" && !ownAudioUrl}
         className="absolute h-0 w-0"
         onPlay={() => setPlaying(true)}
-        onPause={() => setPlaying(false)}
-        onEnded={() => setPlaying(false)}
+        onPause={() => {
+          stopBed();
+          setPlaying(false);
+        }}
+        onEnded={() => {
+          stopBed();
+          setPlaying(false);
+        }}
         onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
         onTimeUpdate={(event) => setCurrent(event.currentTarget.currentTime || 0)}
       />

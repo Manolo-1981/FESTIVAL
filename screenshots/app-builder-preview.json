@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "Escena",
+      "hasCanvas": false,
+      "bodyTextLen": 1085,
+      "bodyTextHash": "9070b43327cc3227646eeddcf034e70e73782db1e8cbf42299130957249dcb35",
+      "bodyTextPrefix": "Escena Una foto, una canción y el fondo que elijas. Subir foto C",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "Escena",
+      "hasCanvas": false,
+      "bodyTextLen": 687,
+      "bodyTextHash": "12079f8c3ff083c83fa1731cc33f642bca1669932cb3f713a24d18249df338ca",
+      "bodyTextPrefix": "Escena Una foto, una canción y el fondo que elijas. Subir foto C",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-preview.json"
+}

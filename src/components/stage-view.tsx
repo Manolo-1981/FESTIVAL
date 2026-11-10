@@ -101,6 +101,7 @@ export function StageView({ stageRef, personRef, videoUrl, playing, onPhoto }: S
             src={videoUrl}
             className="absolute inset-0 h-full w-full bg-bg object-contain"
             controls
+            muted
             autoPlay
             playsInline
           />

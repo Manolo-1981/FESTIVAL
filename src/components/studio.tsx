@@ -11,7 +11,7 @@ import { DEMO_LYRICS, LYRIC_LIMIT, formatTime, lineAt, lyricLines } from "@/lib/
 import { downloadClip, pollSingingClip, singStatus, startSingingClip } from "@/lib/sing";
 import { useStudio, type ClipSeconds } from "@/lib/studio-store";
 
-type ModuleId = "cantar" | "fondo" | "mas";
+type ModuleId = "cantar" | "fondo" | "personaje";
 type Job =
   | { state: "idle" }
   | { state: "preparing" }
@@ -124,14 +124,11 @@ export function Studio() {
   useEffect(() => {
     aliveRef.current = true;
     const rehydrated = useStudio.persist.rehydrate();
-    void Promise.resolve(rehydrated).then(async () => {
+    void Promise.resolve(rehydrated).then(() => {
       const state = useStudio.getState();
-      if (!aliveRef.current || state.backing === "none" || state.audioUrl) return;
-      const url = await backingObjectUrl(state.backing);
-      if (!aliveRef.current) return;
-      const current = useStudio.getState();
-      if (current.backing === "none" || current.audioUrl) return;
-      useStudio.getState().patch({ audioUrl: url, audioName: BACKING_NAME[current.backing] });
+      if (state.backing !== "none" && !state.audioUrl) {
+        useStudio.getState().patch({ backing: "none" });
+      }
     });
     void singStatus()
       .then((status) => {
@@ -149,6 +146,15 @@ export function Studio() {
     setCurrent(0);
     setDuration(0);
     setPlaying(false);
+    const graph = graphRef.current;
+    graphRef.current = null;
+    if (!graph) return;
+    try {
+      graph.bed?.stop();
+      void graph.ctx.close();
+    } catch {
+      /* el audio anterior ya se cerró */
+    }
   }, [audioUrl]);
 
   useEffect(() => {
@@ -159,11 +165,14 @@ export function Studio() {
       const audio = audioRef.current;
       const graph = graphRef.current;
       let energy = 0;
-      if (audio && graph && !audio.paused) {
+      if (audio && !audio.paused) {
+        energy = 0.35 + 0.4 * Math.abs(Math.sin(audio.currentTime * 7));
+      }
+      if (audio && graph && !audio.paused && useStudio.getState().backing !== "none" && useStudio.getState().ownAudioUrl) {
         graph.analyser.getByteFrequencyData(graph.bins as Uint8Array<ArrayBuffer>);
         let sum = 0;
         for (let i = 0; i < graph.bins.length; i++) sum += graph.bins[i];
-        energy = sum / graph.bins.length / 255;
+        energy = Math.max(energy, sum / graph.bins.length / 255);
       }
       const meter = meterRef.current;
       if (meter) {
@@ -206,14 +215,10 @@ export function Studio() {
   }, []);
 
   function ensureGraph() {
-    const audio = audioRef.current;
-    if (!audio) return null;
     if (graphRef.current) return graphRef.current;
     const ctx = new AudioContext();
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 64;
-    const source = ctx.createMediaElementSource(audio);
-    source.connect(analyser);
     analyser.connect(ctx.destination);
     const bins = new Uint8Array(analyser.frequencyBinCount);
     graphRef.current = { ctx, analyser, bins, bed: null, bedGain: null };
@@ -242,10 +247,11 @@ export function Studio() {
     const state = useStudio.getState();
     if (state.backing === "none" || !state.ownAudioUrl) return;
     const graph = ensureGraph();
-    const audio = audioRef.current;
-    if (!graph || !audio) return;
+    if (!graph) return;
     const buffer = await backingBuffer(state.backing);
-    if (token !== bedToken.current || audio.paused) return;
+    const audio = audioRef.current;
+    if (token !== bedToken.current || !audio || audio.paused) return;
+    if (graph.ctx.state !== "running") await graph.ctx.resume();
     if (graph.bed) {
       try {
         graph.bed.stop();
@@ -269,11 +275,13 @@ export function Studio() {
 
   async function toggle() {
     const audio = audioRef.current;
-    if (!audio || !useStudio.getState().audioUrl) return;
-    const graph = ensureGraph();
+    const url = useStudio.getState().audioUrl;
+    if (!audio || !url) return;
+    audio.volume = 1;
+    audio.muted = false;
     try {
-      if (graph && graph.ctx.state === "suspended") await graph.ctx.resume();
       if (audio.paused) {
+        if ((audio.currentSrc || "") !== url) audio.src = url;
         await audio.play();
         await startBed();
       } else {
@@ -281,7 +289,7 @@ export function Studio() {
         audio.pause();
       }
     } catch {
-      setNotice("No se pudo reproducir ese audio.");
+      setNotice("No se pudo reproducir. Sube el volumen del teléfono y pulsa Reproducir otra vez.");
     }
   }
   toggleRef.current = toggle;
@@ -290,7 +298,7 @@ export function Studio() {
     try {
       const raw = await takePhoto(file);
       setNotice("");
-      setStatus("Separando a la persona del fondo de la foto…");
+      setStatus("Separando al personaje del fondo de la foto…");
       try {
         const cut = await cutoutPerson(raw);
         URL.revokeObjectURL(raw);
@@ -299,7 +307,7 @@ export function Studio() {
         setStatus("");
       } catch (error) {
         replaceBlob(useStudio.getState().personUrl, raw);
-        patch({ personUrl: raw });
+        patch({ personUrl: raw, mask: "completo" });
         setStatus("");
         setNotice(error instanceof Error ? error.message : "No pude separar el fondo. La foto se muestra completa.");
       }
@@ -334,6 +342,7 @@ export function Studio() {
         audioName: file.name,
       });
       setNotice("");
+      setStatus(`Audio registrado: ${file.name}`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "No se pudo abrir el audio.");
     }
@@ -415,6 +424,7 @@ export function Studio() {
           scene: sceneKey(state.bgId),
           duration: state.clipSeconds,
           action: state.action,
+          music: state.backing,
         },
       });
       if (!aliveRef.current) return;
@@ -433,8 +443,6 @@ export function Studio() {
           return;
         }
         if (polled.status === "done") {
-          audioRef.current?.pause();
-          stopBed();
           setVideoUrl(polled.url);
           setJob({ state: "ready" });
           return;
@@ -535,14 +543,14 @@ export function Studio() {
             </button>
             <button
               type="button"
-              aria-pressed={module === "mas"}
+              aria-pressed={module === "personaje"}
               className={cn(
                 "min-h-11 rounded-md text-sm font-medium",
-                module === "mas" ? "bg-accent text-accent-fg" : "text-muted",
+                module === "personaje" ? "bg-accent text-accent-fg" : "text-muted",
               )}
-              onClick={() => setModule("mas")}
+              onClick={() => setModule("personaje")}
             >
-              Más
+              Personaje
             </button>
           </div>
 
@@ -640,9 +648,9 @@ export function Studio() {
                 ))}
               </div>
               <p className="text-sm text-muted">
-                {backing !== "none" && ownAudioUrl
-                  ? "La pista suena debajo de tu canción."
-                  : "Pistas originales para el escenario. El video cantado lleva su propia música."}
+                {ownAudioUrl
+                  ? "Tu audio quedó registrado. Reproducir lo hace sonar. El video no inserta ese archivo: canta la letra y usa el estilo que marques."
+                  : "Si eliges Bolero, Suave, Balada o Compás, pulsa Reproducir. Ahí se oye la pista. El video usa ese mismo estilo, no un archivo."}
               </p>
               <div className="flex flex-wrap gap-2">
                 <label className="inline-flex min-h-11 cursor-pointer items-center justify-center gap-2 rounded-lg border border-line bg-surface-2 px-4 text-sm font-medium text-fg">
@@ -665,7 +673,13 @@ export function Studio() {
                   </Button>
                 ) : null}
               </div>
-              {audioName ? <p className="truncate text-sm text-muted">{audioName}</p> : null}
+              {audioName ? (
+                <p className="truncate text-sm text-fg">
+                  {duration > 0 ? `Registrado: ${audioName} · ${formatTime(duration)}` : `Registrado: ${audioName}`}
+                </p>
+              ) : (
+                <p className="text-sm text-muted">Todavía no hay audio registrado.</p>
+              )}
               <div className="flex items-center gap-3">
                 <Button onClick={() => void toggle()} disabled={!audioUrl}>
                   {playing ? <Pause className="size-4" /> : <Play className="size-4" />}
@@ -724,8 +738,7 @@ export function Studio() {
             <div className="grid gap-2 border-t border-line pt-4">
               <h3 className="text-sm font-medium text-fg">Video cantado</h3>
               <p className="text-sm text-muted">
-                La foto canta la letra, con música, sobre el fondo de ahora. Tu audio no entra en el video:
-                suena en el escenario. 10 y 15 segundos usan más créditos.
+                La foto canta la letra en el video. Tu audio no se inserta en ese archivo: queda registrado y suena con Reproducir. La voz del clip se oye al subir su volumen. 10 y 15 segundos usan más créditos.
               </p>
               {ai && !ai.enabled ? (
                 <p className="text-sm text-muted">
@@ -778,7 +791,7 @@ export function Studio() {
             )}
           >
             <div>
-              <h2 className="font-display text-2xl font-medium text-fg">Módulo de fondo</h2>
+              <h2 className="font-display text-2xl font-medium text-fg">Fondo</h2>
               <p className="mt-1 text-sm text-muted">
                 Cambia la escena, súbela o mueve la foto. También puedes arrastrarla en el escenario.
               </p>
@@ -865,7 +878,7 @@ export function Studio() {
                 onChange={(value) => patch({ mask: value })}
               />
               <p className="text-sm text-muted">
-                Al subir la foto se quita su fondo, para que la persona quede sobre esta escena.
+                Se quita el fondo de la foto. El personaje queda sobre el fondo elegido.
               </p>
             </fieldset>
 
@@ -883,19 +896,19 @@ export function Studio() {
           <section
             className={cn(
               "panel grid gap-4 border border-line bg-surface p-4",
-              module !== "mas" && "hidden lg:block",
+              module !== "personaje" && "hidden lg:block",
             )}
           >
             <div>
-              <h2 className="font-display text-2xl font-medium text-fg">Adicionales</h2>
+              <h2 className="font-display text-2xl font-medium text-fg">Personaje</h2>
               <p className="mt-1 text-sm text-muted">
-                Escribe qué hace la persona en la escena y cuánto dura el video.
+                Qué hace en la escena. La letra se canta en español, sin traducirla.
               </p>
             </div>
 
             <label className="grid gap-2 text-sm text-muted">
               <span className="flex items-center justify-between">
-                Prompt de la escena
+                El personaje
                 <span className="tabular-nums">
                   {action.length}/{ACTION_LIMIT}
                 </span>
@@ -929,11 +942,13 @@ export function Studio() {
       </div>
 
       <audio
+        key={audioUrl ?? "sin-audio"}
         ref={audioRef}
         src={audioUrl ?? undefined}
-        preload="metadata"
+        preload="auto"
+        playsInline
         loop={backing !== "none" && !ownAudioUrl}
-        className="absolute h-0 w-0"
+        className="pointer-events-none fixed top-0 left-0 h-8 w-8 opacity-0"
         onPlay={() => setPlaying(true)}
         onPause={() => {
           stopBed();
@@ -942,6 +957,10 @@ export function Studio() {
         onEnded={() => {
           stopBed();
           setPlaying(false);
+        }}
+        onError={(event) => {
+          if (event.currentTarget.error?.code === 1) return;
+          setNotice("No se pudo leer ese audio. Usa MP3, M4A o WAV.");
         }}
         onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
         onTimeUpdate={(event) => setCurrent(event.currentTarget.currentTime || 0)}

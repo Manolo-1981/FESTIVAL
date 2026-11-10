@@ -1,12 +1,14 @@
-export type BackingId = "suave" | "balada" | "compas";
+export type BackingId = "bolero" | "suave" | "balada" | "compas";
 
 export const BACKINGS: { id: BackingId; label: string }[] = [
+  { id: "bolero", label: "Bolero" },
   { id: "suave", label: "Suave" },
   { id: "balada", label: "Balada" },
   { id: "compas", label: "Compás" },
 ];
 
 export const BACKING_NAME: Record<BackingId, string> = {
+  bolero: "Bolero",
   suave: "Acompañamiento suave",
   balada: "Balada",
   compas: "Compás",
@@ -39,8 +41,8 @@ function tone(
   osc.type = type;
   osc.frequency.value = midi(note);
   gain.gain.setValueAtTime(0.0001, start);
-  gain.gain.exponentialRampToValueAtTime(gainValue, start + 0.06);
-  gain.gain.setValueAtTime(gainValue, Math.max(start + 0.08, end - 0.2));
+  gain.gain.exponentialRampToValueAtTime(gainValue, start + 0.05);
+  gain.gain.setValueAtTime(gainValue * 0.7, Math.max(start + 0.08, end - 0.25));
   gain.gain.exponentialRampToValueAtTime(0.0001, end);
   osc.connect(gain);
   gain.connect(ctx.destination);
@@ -48,48 +50,61 @@ function tone(
   osc.stop(end + 0.02);
 }
 
-function pulse(ctx: OfflineAudioContext, start: number, freq: number, gainValue: number) {
+function hit(ctx: OfflineAudioContext, start: number, freq: number, gainValue: number, decay: number) {
   const osc = ctx.createOscillator();
   const gain = ctx.createGain();
-  osc.type = "sine";
+  osc.type = freq > 180 ? "triangle" : "sine";
   osc.frequency.setValueAtTime(freq, start);
-  osc.frequency.exponentialRampToValueAtTime(46, start + 0.12);
+  osc.frequency.exponentialRampToValueAtTime(Math.max(40, freq * 0.45), start + decay);
   gain.gain.setValueAtTime(gainValue, start);
-  gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.18);
+  gain.gain.exponentialRampToValueAtTime(0.0001, start + decay);
   osc.connect(gain);
   gain.connect(ctx.destination);
   osc.start(start);
-  osc.stop(start + 0.2);
+  osc.stop(start + decay + 0.02);
+}
+
+function normalize(buffer: AudioBuffer) {
+  let peak = 0;
+  for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
+    const data = buffer.getChannelData(channel);
+    for (let index = 0; index < data.length; index++) peak = Math.max(peak, Math.abs(data[index]));
+  }
+  if (peak < 0.001) return buffer;
+  const gain = 0.78 / peak;
+  for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
+    const data = buffer.getChannelData(channel);
+    for (let index = 0; index < data.length; index++) data[index] *= gain;
+  }
+  return buffer;
 }
 
 async function render(id: BackingId) {
-  const seconds = 24;
+  const seconds = 12;
   const rate = 22050;
-  const ctx = new OfflineAudioContext(2, rate * seconds, rate);
-  const setup =
-    id === "balada"
-      ? { bar: 4, bars: 6, chords: [0, 5, 3, 7], minor: true, type: "sine" as const, level: 0.045 }
-      : id === "compas"
-        ? { bar: 2.4, bars: 10, chords: [0, 7, 5, 3], minor: false, type: "triangle" as const, level: 0.04 }
-        : { bar: 3, bars: 8, chords: [0, 5, 7, 3], minor: false, type: "sine" as const, level: 0.04 };
-  const root = 48;
-  for (let index = 0; index < setup.bars; index++) {
-    const step = setup.chords[index % setup.chords.length];
-    const start = index * setup.bar;
-    const third = setup.minor ? 3 : 4;
-    const notes = [root + step, root + step + third, root + step + 7, root + step + 12];
-    notes.forEach((note, noteIndex) => {
-      tone(ctx, note, start, start + setup.bar * 0.96, noteIndex === 0 ? setup.level * 1.3 : setup.level, setup.type);
-    });
-    tone(ctx, root + step - 12, start, start + setup.bar * 0.96, 0.07, "sine");
-  }
-  if (id !== "balada") {
-    const beat = setup.bar / 4;
-    for (let start = 0; start < seconds - 0.05; start += id === "compas" ? beat : beat * 2) {
-      pulse(ctx, start, id === "compas" ? 128 : 110, id === "compas" ? 0.2 : 0.14);
+  const ctx = new OfflineAudioContext(1, rate * seconds, rate);
+  const minor = id === "bolero" || id === "balada";
+  const bar = id === "compas" ? 1.6 : id === "suave" ? 2 : 3;
+  const chords = id === "compas" ? [0, 7, 5, 3] : [0, 5, 3, 7];
+  const root = id === "bolero" ? 50 : 48;
+  const bars = Math.floor(seconds / bar);
+
+  for (let index = 0; index < bars; index++) {
+    const step = chords[index % chords.length];
+    const start = index * bar;
+    const third = minor ? 3 : 4;
+    tone(ctx, root + step, start, start + bar, 0.16, "sine");
+    tone(ctx, root + step + third, start, start + bar, 0.08, id === "compas" ? "triangle" : "sine");
+    tone(ctx, root + step + 7, start, start + bar, 0.07, "sine");
+    if (id !== "balada") {
+      const beat = bar / 4;
+      hit(ctx, start, 90, id === "bolero" ? 0.45 : 0.32, 0.18);
+      hit(ctx, start + beat * 2, 120, 0.22, 0.14);
+      if (id === "bolero" || id === "compas") hit(ctx, start + beat * 1.5, 240, 0.16, 0.08);
     }
   }
-  return ctx.startRendering();
+
+  return normalize(await ctx.startRendering());
 }
 
 function wavBlob(buffer: AudioBuffer) {

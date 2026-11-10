@@ -10,12 +10,12 @@ const ACTION_LIMIT = 400;
 const gate = { windowStart: 0, count: 0, last: 0 };
 
 const SCENES: Record<string, string> = {
-  teatro: "small theater stage",
-  estudio: "vocal recording booth",
-  calle: "wet city street at night",
-  sala: "concert hall seen from the stage",
-  costa: "coastal terrace at dusk",
-  propio: "custom background shown in the still",
+  teatro: "un teatro pequeño",
+  estudio: "una cabina de grabación",
+  calle: "una calle de noche",
+  sala: "una sala de concierto",
+  costa: "una terraza frente al mar",
+  propio: "el fondo que ya se ve en la imagen",
 };
 
 type ClipSeconds = 6 | 10 | 15;
@@ -43,6 +43,27 @@ function cleanText(value: unknown, limit: number) {
   return (typeof value === "string" ? value : "").replace(/\s+/g, " ").trim().slice(0, limit);
 }
 
+function sungLyrics(raw: string) {
+  const lines = raw
+    .split(/\n+/)
+    .map((line) => line.replace(/\p{Extended_Pictographic}/gu, "").replace(/\uFE0F/g, "").trim())
+    .filter(Boolean)
+    .filter((line) => {
+      if (/^\(.+\)$/.test(line)) return false;
+      if (/^(verso|estrofa|coro|intro|puente|bridge|verse)\b/i.test(line)) return false;
+      return true;
+    });
+  return lines.join("\n").slice(0, LYRIC_LIMIT);
+}
+
+const MUSIC: Record<string, string> = {
+  bolero: "De fondo suena un bolero lento. No lo anuncies ni lo describas.",
+  suave: "De fondo suena música suave. No la anuncies ni la describas.",
+  balada: "De fondo suena una balada lenta. No la anuncies ni la describas.",
+  compas: "De fondo suena un ritmo claro. No lo anuncies ni lo describas.",
+  none: "De fondo suena música. No la anuncies. No cantes a capela.",
+};
+
 async function friendlyError(res: Response): Promise<string> {
   if (res.status === 429) return "Hay demasiadas solicitudes. Espera un momento.";
   return "No se pudo generar el video. Revisa la foto y la letra, e inténtalo de nuevo.";
@@ -59,6 +80,7 @@ type StartInput = {
   scene: string;
   duration?: ClipSeconds;
   action?: string;
+  music?: string;
 };
 
 export const startSingingClip = createServerFn({ method: "POST" })
@@ -70,10 +92,11 @@ export const startSingingClip = createServerFn({ method: "POST" })
     }
 
     const image = typeof data?.imageDataUrl === "string" ? data.imageDataUrl : "";
-    const lyrics = cleanText(data?.lyrics, LYRIC_LIMIT);
+    const lyrics = sungLyrics(typeof data?.lyrics === "string" ? data.lyrics : "");
     const action = cleanText(data?.action, ACTION_LIMIT);
     const scene = SCENES[data?.scene] ?? SCENES.teatro;
     const duration = clipSeconds(data?.duration);
+    const music = MUSIC[typeof data?.music === "string" ? data.music : "none"] ?? MUSIC.none;
 
     if (!image.startsWith("data:image/")) {
       return { ok: false as const, error: "La imagen de la escena no es válida." };
@@ -104,17 +127,16 @@ export const startSingingClip = createServerFn({ method: "POST" })
     }
 
     const prompt = [
-      "Animate this still. The person is already placed on the chosen background.",
-      "Do not restore the original photo background, a frame, a box, or a pasted rectangle around them.",
-      "Keep the face, age, hair, glasses, beard and clothes identical. Do not change who they are.",
-      action
-        ? `The person does this: ${action}.`
-        : "The person sings toward the camera with a small natural gesture.",
+      "Anima a la misma persona de la foto. Conserva su rostro, edad, pelo, lentes, barba y ropa.",
+      "No la cambies por otra. No tapes la imagen con otro recuadro.",
+      music,
+      action ? `Mientras canta, hace esto, pero no lo dice: ${action}.` : "Canta mirando a la cámara.",
       lyrics
-        ? `They sing these Spanish lyrics with natural lip movement, a clear calm voice, and musical accompaniment with soft instruments, not a cappella. Lyrics: "${lyrics}"`
-        : "Soft musical accompaniment plays. Do not invent sung lyrics.",
-      `Keep the ${scene} background still. Do not add text, logos, captions or extra people.`,
-    ].join(" ");
+        ? `Canta en español latinoamericano, con pronunciación natural, como una canción. No traduzcas. No hables en inglés. No mezcles idiomas. No recites con acento extranjero. Canta exactamente estas frases:\n${lyrics}`
+        : "No inventes una letra.",
+      "Sin subtítulos, sin texto en pantalla y sin una segunda voz que traduzca.",
+      `El lugar sigue siendo ${scene}. No lo menciones. No agregues otras personas.`,
+    ].join("\n");
 
     let res: Response;
     try {
